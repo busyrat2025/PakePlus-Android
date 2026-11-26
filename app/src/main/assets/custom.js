@@ -1,6 +1,6 @@
 window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("script");t.src="https://www.googletagmanager.com/gtag/js?id=G-W5GKHM0893",t.async=!0,document.head.appendChild(t);const n=document.createElement("script");n.textContent="window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'G-W5GKHM0893');",document.body.appendChild(n)});/*!
  * Pake Userscript Loader — 注入式 Userscript 管理器
- * 构建时间：2026-11-25T14:58:12.438Z
+ * 构建时间：2026-11-25T15:55:43.492Z
  * 说明：本文件由 esbuild 打包，供 PakePlus custom_js 注入使用。
  */
 "use strict";
@@ -2498,13 +2498,16 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
 .fab:active{background:rgba(45,56,78,.92)}
 /* 面板滑出后齿轮正好压在标题栏上，打开期间直接藏起来 */
 .open .fab{display:none}
-.mask{position:absolute;inset:0;background:rgba(0,0,0,.45);pointer-events:auto;opacity:0;
-  transition:opacity .2s}
-.panel{position:absolute;top:0;right:0;bottom:0;width:min(370px,94vw);pointer-events:auto;
+/* 关闭时必须彻底退出点命中测试：opacity:0 的透明层依然吃点击，
+   会把整个页面的内容变成「点不动」。pointer-events + visibility 双保险。 */
+.mask{position:absolute;inset:0;background:rgba(0,0,0,.45);pointer-events:none;
+  opacity:0;visibility:hidden;transition:opacity .2s,visibility .2s}
+.panel{position:absolute;top:0;right:0;bottom:0;width:min(370px,94vw);pointer-events:none;
   background:#151a24;border-left:1px solid #2a3345;display:flex;flex-direction:column;
-  transform:translateX(101%);transition:transform .24s cubic-bezier(.22,.85,.25,1)}
-.open .mask{opacity:1}
-.open .panel{transform:translateX(0)}
+  transform:translateX(101%);visibility:hidden;
+  transition:transform .24s cubic-bezier(.22,.85,.25,1),visibility .24s}
+.open .mask{opacity:1;pointer-events:auto;visibility:visible}
+.open .panel{pointer-events:auto;visibility:visible;transform:translateX(0)}
 .head{display:flex;align-items:center;gap:8px;padding:12px 12px 10px;border-bottom:1px solid #242c3b;flex:none}
 .title{font-size:14px;font-weight:700}
 .ver{font-size:10px;color:#7f8b9e;border:1px solid #333d4f;border-radius:4px;padding:0 5px}
@@ -2582,10 +2585,14 @@ details[open] summary::before{content:"▾ "}
       this.host = null;
       this.root = null;
       this.open = false;
+      this.guard = null;
       this.deps = deps;
     }
     mount() {
-      if (this.host) return;
+      if (this.host) {
+        this.reattach();
+        return;
+      }
       const host = document.createElement("div");
       host.id = HOST_ID;
       host.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483640";
@@ -2615,10 +2622,31 @@ details[open] summary::before{content:"▾ "}
       wrap.addEventListener("change", (e) => this.onChange(e));
       wrap.addEventListener("input", (e) => this.onInput(e));
       this.render();
+      this.guardMount();
+    }
+    /** 宿主被摘掉时接回去。 */
+    reattach() {
+      if (!this.host) return;
+      if (this.host.isConnected) return;
+      (document.body || document.documentElement).appendChild(this.host);
+    }
+    /**
+     * missav 是 SPA，框架在路由切换时可能重建 body，把宿主元素一起清掉 ——
+     * 表现就是「按钮全部消失，且再也点不回来」。这里盯着 html / body 的直接子节点，
+     * 发现宿主不在文档里就自己接回去。只监听一层，不 subtree，避免整页 DOM 抖动带来的开销。
+     */
+    guardMount() {
+      if (this.guard) return;
+      const mo = new MutationObserver(() => this.reattach());
+      mo.observe(document.documentElement, { childList: true });
+      if (document.body) mo.observe(document.body, { childList: true });
+      this.guard = mo;
     }
     destroy() {
-      var _a;
-      (_a = this.host) == null ? void 0 : _a.remove();
+      var _a, _b;
+      (_a = this.guard) == null ? void 0 : _a.disconnect();
+      this.guard = null;
+      (_b = this.host) == null ? void 0 : _b.remove();
       this.host = null;
       this.root = null;
     }
@@ -3106,7 +3134,7 @@ details[open] summary::before{content:"▾ "}
   }
 
   // src/index.ts
-  var LOADER_VERSION = "1.0.0";
+  var LOADER_VERSION = "1.0.1";
   var SCRIPTS_KEY = "scripts";
   var BOOT_FLAG = "__PAKE_USERSCRIPT_LOADER__";
   var state = {
