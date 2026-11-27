@@ -1,6 +1,6 @@
 window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("script");t.src="https://www.googletagmanager.com/gtag/js?id=G-W5GKHM0893",t.async=!0,document.head.appendChild(t);const n=document.createElement("script");n.textContent="window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'G-W5GKHM0893');",document.body.appendChild(n)});/*!
  * Pake Userscript Loader — 注入式 Userscript 管理器
- * 构建时间：2026-11-25T15:55:43.492Z
+ * 构建时间：2026-11-26T16:38:45.683Z
  * 说明：本文件由 esbuild 打包，供 PakePlus custom_js 注入使用。
  */
 "use strict";
@@ -171,10 +171,18 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     updateIntervalHours: 24,
     enabled: true,
     showFab: true,
+    // 默认放左上角：右上角是站点自己的设置/搜索区，最容易被挡住。
+    // 用户按住齿轮拖到别处后这里会变成 "x,y"。
+    fabPosition: "",
     // 字幕脚本要访问第三方字幕站，多数站点不给 CORS 头。
     // 留空 = 直连；填了模板（含 {url}）后，直连失败会自动改走中继。
     corsProxy: "",
-    verifySignature: false
+    verifySignature: false,
+    // 视频站的广告蒙层基本靠"点一下就跳走"赚钱，默认全挡。
+    blockExternalNav: true,
+    removeAdOverlay: true,
+    notifyBlocked: true,
+    allowHosts: ""
   };
   function normalizeConfig(raw) {
     const v = raw && typeof raw === "object" ? raw : {};
@@ -184,6 +192,11 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
       const n = Number(x);
       return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
     };
+    const pos = (x) => {
+      if (typeof x !== "string") return "";
+      const m = /^(-?\d{1,5})\s*,\s*(-?\d{1,5})$/.exec(x.trim());
+      return m ? `${Number(m[1])},${Number(m[2])}` : "";
+    };
     const channel = v.channel === "beta" ? "beta" : "stable";
     return {
       manifestUrl: str(v.manifestUrl, DEFAULT_CONFIG.manifestUrl),
@@ -192,8 +205,13 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
       updateIntervalHours: num(v.updateIntervalHours, DEFAULT_CONFIG.updateIntervalHours, 1, 720),
       enabled: bool(v.enabled, DEFAULT_CONFIG.enabled),
       showFab: bool(v.showFab, DEFAULT_CONFIG.showFab),
+      fabPosition: pos(v.fabPosition),
       corsProxy: str(v.corsProxy, DEFAULT_CONFIG.corsProxy),
-      verifySignature: bool(v.verifySignature, DEFAULT_CONFIG.verifySignature)
+      verifySignature: bool(v.verifySignature, DEFAULT_CONFIG.verifySignature),
+      blockExternalNav: bool(v.blockExternalNav, DEFAULT_CONFIG.blockExternalNav),
+      removeAdOverlay: bool(v.removeAdOverlay, DEFAULT_CONFIG.removeAdOverlay),
+      notifyBlocked: bool(v.notifyBlocked, DEFAULT_CONFIG.notifyBlocked),
+      allowHosts: str(v.allowHosts, DEFAULT_CONFIG.allowHosts).slice(0, 2e3)
     };
   }
   async function loadConfig() {
@@ -1759,6 +1777,202 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
   // src/keys.ts
   var MANIFEST_PUBLIC_KEY = "";
 
+  // src/adblock.ts
+  var SAFE_PROTOCOLS = /* @__PURE__ */ new Set(["javascript:", "mailto:", "tel:", "blob:", "data:", "about:"]);
+  var OVERLAY_AREA_RATIO = 0.28;
+  var getConfig = () => ({});
+  var onBlock = () => {
+  };
+  var installed = false;
+  var blockedCount = 0;
+  var lastBlocked = "";
+  var clickSource = null;
+  var clickTimer = 0;
+  function adBlockStats() {
+    return { count: blockedCount, last: lastBlocked };
+  }
+  function installAdBlock(opts) {
+    getConfig = opts.getConfig;
+    onBlock = opts.onBlock;
+    if (installed) return;
+    installed = true;
+    installClickGuard();
+    installWindowOpenGuard();
+    installFormGuard();
+    installAnchorClickGuard();
+    installLocationGuard();
+  }
+  function baseDomain(host) {
+    const parts = host.toLowerCase().split(".");
+    if (parts.length <= 2) return parts.join(".");
+    const secondLevel = parts[parts.length - 2];
+    if (/^(co|com|net|org|gov|edu|ac)$/.test(secondLevel)) return parts.slice(-3).join(".");
+    return parts.slice(-2).join(".");
+  }
+  function brandLabel(host) {
+    const parts = baseDomain(host).split(".");
+    return parts[0] || "";
+  }
+  function allowList() {
+    const raw = (getConfig().allowHosts || "").split(/[\s,]+/);
+    return raw.map((s) => s.trim().toLowerCase().replace(/^\*?\./, "")).filter(Boolean);
+  }
+  function hostAllowed(host) {
+    const h = host.toLowerCase();
+    const current = location.hostname.toLowerCase();
+    if (h === current) return true;
+    const base = baseDomain(current);
+    if (h === base || h.endsWith("." + base)) return true;
+    const brand = brandLabel(current);
+    if (brand.length >= 4 && brandLabel(h) === brand) return true;
+    for (const allowed of allowList()) {
+      if (h === allowed || h.endsWith("." + allowed)) return true;
+    }
+    return false;
+  }
+  function inspect(rawUrl, base) {
+    const raw = String(rawUrl || "").trim();
+    if (!raw) return { external: false, url: "" };
+    let u;
+    try {
+      u = new URL(raw, base || location.href);
+    } catch {
+      return { external: false, url: raw };
+    }
+    if (SAFE_PROTOCOLS.has(u.protocol)) return { external: false, url: u.href };
+    if (u.protocol !== "http:" && u.protocol !== "https:") return { external: false, url: u.href };
+    return { external: !hostAllowed(u.hostname), url: u.href };
+  }
+  function hideAdLayer(start) {
+    if (!start || !start.isConnected) return false;
+    const viewport = window.innerWidth * window.innerHeight;
+    if (!viewport) return false;
+    let node = start;
+    for (let depth = 0; node && depth < 10; depth++, node = node.parentElement) {
+      if (node === document.body || node === document.documentElement) break;
+      const rect = node.getBoundingClientRect();
+      if (rect.width * rect.height < viewport * OVERLAY_AREA_RATIO) continue;
+      const style = getComputedStyle(node);
+      if (style.position !== "fixed" && style.position !== "absolute") continue;
+      if (node.querySelector("video")) continue;
+      node.setAttribute("data-pake-adblock", "hidden");
+      node.style.setProperty("display", "none", "important");
+      return true;
+    }
+    return false;
+  }
+  function report(kind, url, source) {
+    blockedCount++;
+    lastBlocked = url;
+    try {
+      onBlock(kind, url);
+    } catch {
+    }
+    if (getConfig().removeAdOverlay) hideAdLayer(source || clickSource);
+  }
+  function installClickGuard() {
+    const handler = (e) => {
+      const cfg = getConfig();
+      if (!cfg.blockExternalNav) return;
+      const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+      const origin = path[0] || e.target;
+      clickSource = origin;
+      window.clearTimeout(clickTimer);
+      clickTimer = window.setTimeout(() => {
+        clickSource = null;
+      }, 0);
+      if (!origin || !origin.closest) return;
+      const anchor = origin.closest("a[href],area[href]");
+      if (!anchor) return;
+      const raw = anchor.getAttribute("href") || "";
+      if (!raw || raw.startsWith("#")) return;
+      const { external, url } = inspect(raw, anchor.href || location.href);
+      if (!external) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      report("链接点击", url, anchor);
+    };
+    window.addEventListener("click", handler, true);
+    window.addEventListener("auxclick", handler, true);
+  }
+  function installWindowOpenGuard() {
+    const w = window;
+    const rawOpen = w.open;
+    if (typeof rawOpen !== "function" || rawOpen.__pakePatched) return;
+    const patched = function(url, ...rest) {
+      if (url && getConfig().blockExternalNav) {
+        const { external, url: abs } = inspect(String(url), location.href);
+        if (external) {
+          report("window.open", abs);
+          return null;
+        }
+      }
+      return rawOpen.apply(w, [url, ...rest]);
+    };
+    patched.__pakePatched = true;
+    w.open = patched;
+  }
+  function installFormGuard() {
+    const proto = HTMLFormElement.prototype;
+    const raw = proto.submit;
+    if (typeof raw !== "function" || raw.__pakePatched) return;
+    const patched = function() {
+      if (getConfig().blockExternalNav) {
+        const action = this.getAttribute("action") || location.href;
+        const { external, url } = inspect(action, location.href);
+        if (external) {
+          report("表单提交", url, this);
+          return;
+        }
+      }
+      return raw.apply(this, arguments);
+    };
+    patched.__pakePatched = true;
+    proto.submit = patched;
+  }
+  function installAnchorClickGuard() {
+    const proto = HTMLAnchorElement.prototype;
+    const raw = proto.click;
+    if (typeof raw !== "function" || raw.__pakePatched) return;
+    const patched = function() {
+      if (getConfig().blockExternalNav) {
+        const href = this.getAttribute("href") || "";
+        if (href) {
+          const { external, url } = inspect(href, this.href || location.href);
+          if (external) {
+            report("程序化点击", url, this);
+            return;
+          }
+        }
+      }
+      return raw.apply(this, arguments);
+    };
+    patched.__pakePatched = true;
+    proto.click = patched;
+  }
+  function installLocationGuard() {
+    const proto = Location.prototype;
+    for (const method of ["assign", "replace"]) {
+      const raw = proto[method];
+      if (typeof raw !== "function" || raw.__pakePatched) continue;
+      const patched = function(url) {
+        if (getConfig().blockExternalNav) {
+          const { external, url: abs } = inspect(String(url), location.href);
+          if (external) {
+            report("location." + method, abs, clickSource);
+            return;
+          }
+        }
+        return raw.apply(this, arguments);
+      };
+      patched.__pakePatched = true;
+      try {
+        proto[method] = patched;
+      } catch {
+      }
+    }
+  }
+
   // src/logger.ts
   var MAX_ENTRIES = 200;
   var LS_KEY = "__pake_loader_logs__";
@@ -1860,6 +2074,41 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
     if (!proxy) return target;
     if (proxy.includes("{url}")) return proxy.replace(/\{url\}/g, encodeURIComponent(target));
     return proxy + target;
+  }
+  function nativeChannelInfo() {
+    const w = window;
+    const globalTauri = !!(w.__TAURI__ && w.__TAURI__.http && typeof w.__TAURI__.http.fetch === "function");
+    const internals = w.__TAURI_INTERNALS__;
+    return { globalTauri, ipc: !!(internals && typeof internals.invoke === "function") };
+  }
+  async function ipcFetch(target, init) {
+    const internals = window.__TAURI_INTERNALS__;
+    if (!internals || typeof internals.invoke !== "function") throw new Error("ipc 不可用");
+    const headers = {};
+    new Headers(init.headers || {}).forEach((value, key) => {
+      headers[key] = value;
+    });
+    const clientConfig = {
+      url: target,
+      method: (init.method || "GET").toUpperCase(),
+      headers
+    };
+    if (typeof init.body === "string" && init.body) {
+      clientConfig.body = Array.from(new TextEncoder().encode(init.body));
+    }
+    const res = await internals.invoke("plugin:http|fetch", { clientConfig });
+    if (!res || typeof res.status !== "number") throw new Error("ipc fetch 返回异常");
+    let body = null;
+    if (res.rid !== void 0 && res.rid !== null) {
+      const raw = await internals.invoke("plugin:http|fetch_read_body", { rid: res.rid });
+      if (raw instanceof ArrayBuffer) body = new Uint8Array(raw);
+      else if (raw && typeof raw.length === "number") body = new Uint8Array(raw);
+    }
+    return new Response(body ? body.buffer : null, {
+      status: res.status,
+      statusText: res.statusText || "",
+      headers: res.headers || {}
+    });
   }
   function createGmApi(ctx) {
     const scriptId = ctx.script.id;
@@ -2047,13 +2296,12 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
         if (typeof nativeFetch === "function") {
           return nativeFetch(target, buildInit());
         }
+        return ipcFetch(target, buildInit());
       }
       return fetch(target, buildInit());
     };
-    const hasNative = (() => {
-      const tauri = window.__TAURI__;
-      return !!(tauri && tauri.http && typeof tauri.http.fetch === "function");
-    })();
+    const native = nativeChannelInfo();
+    const hasNative = native.globalTauri || native.ipc;
     let response = null;
     let lastError = null;
     if (hasNative) {
@@ -2487,15 +2735,20 @@ window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("
   var CSS = `
 :host{all:initial}
 *{box-sizing:border-box}
-.wrap{position:fixed;inset:0;z-index:2147483640;pointer-events:none;
+.wrap{position:fixed;inset:0;z-index:2147483647;pointer-events:none;
   font:13px/1.5 "PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;
   color:#e8edf5;-webkit-tap-highlight-color:transparent}
-.fab{position:fixed;top:12px;right:10px;width:42px;height:42px;border-radius:12px;
-  border:1px solid rgba(255,255,255,.16);background:rgba(28,34,48,.82);
-  color:#dbe4f3;font-size:19px;line-height:1;cursor:pointer;pointer-events:auto;
-  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
-  box-shadow:0 4px 14px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center}
+/* 悬浮入口：默认落在左上角（右上角基本被站点的搜索/设置占着）。
+   坐标由 left/top 决定，拖动时直接改这两个值。
+   touch-action:none 是必须的——否则手指一移动就变成页面滚动，拖不动。 */
+.fab{position:fixed;top:12px;left:10px;right:auto;width:42px;height:42px;border-radius:12px;
+  border:1px solid rgba(255,255,255,.16);background:rgba(28,34,48,.92);
+  color:#dbe4f3;font-size:19px;line-height:1;cursor:grab;pointer-events:auto;
+  box-shadow:0 4px 14px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;
+  touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;transition:box-shadow .16s,background .16s}
 .fab:active{background:rgba(45,56,78,.92)}
+.fab.dragging{cursor:grabbing;background:rgba(45,56,78,.96);box-shadow:0 10px 26px rgba(0,0,0,.5)}
 /* 面板滑出后齿轮正好压在标题栏上，打开期间直接藏起来 */
 .open .fab{display:none}
 /* 关闭时必须彻底退出点命中测试：opacity:0 的透明层依然吃点击，
@@ -2586,6 +2839,15 @@ details[open] summary::before{content:"▾ "}
       this.root = null;
       this.open = false;
       this.guard = null;
+      /** 宿主是否已成功进入浏览器的 top layer（popover）。 */
+      this.onTopLayer = false;
+      /** 当前观察到的是哪个 body（SPA 可能把它整个换掉）。 */
+      this.observedBody = null;
+      /** 拖动会话：记录指针按下时相对按钮左上角的偏移，保证跟手不跳。 */
+      this.drag = null;
+      /** 拖动结束浏览器还会补一个 click，不吞掉就会"松手即弹面板"。 */
+      this.suppressClickAt = 0;
+      this.onViewportChange = () => this.applyFabPos();
       this.deps = deps;
     }
     mount() {
@@ -2595,7 +2857,7 @@ details[open] summary::before{content:"▾ "}
       }
       const host = document.createElement("div");
       host.id = HOST_ID;
-      host.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483640";
+      host.style.cssText = "position:fixed;inset:0;margin:0;padding:0;border:0;background:transparent;overflow:visible;width:100vw;height:100vh;pointer-events:none;z-index:2147483647";
       const root = host.attachShadow({ mode: "open" });
       const style = document.createElement("style");
       style.textContent = CSS;
@@ -2621,14 +2883,193 @@ details[open] summary::before{content:"▾ "}
       wrap.addEventListener("click", (e) => this.onClick(e));
       wrap.addEventListener("change", (e) => this.onChange(e));
       wrap.addEventListener("input", (e) => this.onInput(e));
+      window.addEventListener("resize", this.onViewportChange);
+      window.addEventListener("orientationchange", this.onViewportChange);
       this.render();
       this.guardMount();
+      host.addEventListener("toggle", (e) => {
+        const state2 = e.newState;
+        if (state2 !== "closed") return;
+        window.setTimeout(() => this.promote(), 0);
+      });
+      this.promote();
+      window.setTimeout(() => this.promote(), 300);
+      window.setTimeout(() => this.promote(), 1500);
     }
-    /** 宿主被摘掉时接回去。 */
+    /**
+     * 把宿主提到浏览器 top layer。
+     *
+     * z-index 再大也只是「当前层叠上下文里的最大值」——站点只要用更高的值、或者
+     * 在祖先上建立层叠上下文，就能压住我们。popover 的 top layer 与 z-index 无关，
+     * 天然盖在所有普通元素之上，这才是一劳永逸的做法。
+     *
+     * 能力检测放在最前面：不支持 popover 的 WebView 绝不能设这个属性，
+     * 否则 UA 的 `[popover]:not(:popover-open){display:none}` 会让整个 UI 直接消失。
+     */
+    promote() {
+      const host = this.host;
+      if (!host || !host.isConnected) return;
+      if (typeof host.showPopover !== "function") return;
+      try {
+        if (!host.hasAttribute("popover")) host.setAttribute("popover", "manual");
+        if (!host.matches(":popover-open")) host.showPopover();
+        this.onTopLayer = host.matches(":popover-open");
+      } catch {
+        this.onTopLayer = false;
+        try {
+          host.removeAttribute("popover");
+        } catch {
+        }
+      }
+    }
+    /** 宿主被摘掉时接回去；还在文档里则保证它始终压在最后。 */
     reattach() {
       if (!this.host) return;
-      if (this.host.isConnected) return;
-      (document.body || document.documentElement).appendChild(this.host);
+      const parent = document.body || document.documentElement;
+      if (!this.host.isConnected) {
+        parent.appendChild(this.host);
+      } else {
+        this.keepLast();
+      }
+      this.promote();
+    }
+    /**
+     * 保持宿主是父节点的最后一个子元素。
+     *
+     * z-index 相同时，后插入的元素在上层。站点（尤其播放页）会不断往 body 追加浮层，
+     * 后追加的就会把齿轮压住——表现同样是「看得见点不动」。挪到末尾即可盖回去。
+     * 移动本身会触发一次观察回调，下一轮发现已在末尾就停手，不会自激。
+     */
+    keepLast() {
+      const host = this.host;
+      if (!host || !host.isConnected) return;
+      const parent = host.parentNode;
+      if (parent && parent.lastElementChild !== host) parent.appendChild(host);
+    }
+    /**
+     * 处理落在我们 UI 上的事件。返回 true 表示"这个事件归我"，调用方应立刻
+     * stopImmediatePropagation，防止站点的手势层/统计脚本再处理一遍。
+     *
+     * 注册放在 index.ts 启动的第一行，而不是这里——站点脚本可能在
+     * document 刚建好时就注册了捕获监听，晚一步就永远收不到点击。
+     */
+    handleEvent(e) {
+      if (!this.host) return false;
+      const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+      if (path.indexOf(this.host) < 0) return false;
+      if (e.type === "click") {
+        if (Date.now() < this.suppressClickAt) return true;
+        this.onClick(e);
+        return true;
+      }
+      const first = path[0];
+      if (e.type === "pointerdown") {
+        const fab = this.fabEl();
+        if (fab && (first === fab || fab.contains(first))) {
+          this.beginDrag(e, fab);
+          return true;
+        }
+      }
+      if (first && /^(INPUT|SELECT|TEXTAREA|OPTION|LABEL)$/.test(first.tagName)) return false;
+      return true;
+    }
+    fabEl() {
+      var _a;
+      return ((_a = this.root) == null ? void 0 : _a.querySelector(".fab")) || null;
+    }
+    /** 是否正在拖动。index.ts 的最早捕获层据此决定要不要接管 pointermove / up。 */
+    isDragging() {
+      return !!this.drag;
+    }
+    beginDrag(e, fab) {
+      if (this.drag) this.handleDragEnd();
+      if (typeof e.clientX !== "number" || typeof e.clientY !== "number") return;
+      const r = fab.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      fab.style.left = Math.round(r.left) + "px";
+      fab.style.top = Math.round(r.top) + "px";
+      fab.style.right = "auto";
+      fab.classList.add("dragging");
+      this.drag = {
+        pointerId: typeof e.pointerId === "number" ? e.pointerId : -1,
+        offsetX: e.clientX - r.left,
+        offsetY: e.clientY - r.top,
+        startX: e.clientX,
+        startY: e.clientY,
+        moved: false
+      };
+    }
+    /** 拖动中。返回 true 表示这次移动由我们消费，调用方应挡掉站点。 */
+    handleDragMove(e) {
+      const d = this.drag;
+      if (!d) return false;
+      if (d.pointerId >= 0 && typeof e.pointerId === "number" && e.pointerId !== d.pointerId) return false;
+      if (typeof e.buttons === "number" && e.buttons === 0) {
+        this.handleDragEnd();
+        return true;
+      }
+      const fab = this.fabEl();
+      if (!fab) return false;
+      if (!d.moved) {
+        if (Math.abs(e.clientX - d.startX) < 4 && Math.abs(e.clientY - d.startY) < 4) return true;
+        d.moved = true;
+      }
+      const r = fab.getBoundingClientRect();
+      const maxLeft = Math.max(4, window.innerWidth - r.width - 4);
+      const maxTop = Math.max(4, window.innerHeight - r.height - 4);
+      const left = Math.min(maxLeft, Math.max(4, e.clientX - d.offsetX));
+      const top = Math.min(maxTop, Math.max(4, e.clientY - d.offsetY));
+      fab.style.left = Math.round(left) + "px";
+      fab.style.top = Math.round(top) + "px";
+      return true;
+    }
+    handleDragEnd() {
+      const d = this.drag;
+      this.drag = null;
+      const fab = this.fabEl();
+      fab == null ? void 0 : fab.classList.remove("dragging");
+      if (!d) return;
+      if (!d.moved) return;
+      this.suppressClickAt = Date.now() + 500;
+      if (!fab) return;
+      const r = fab.getBoundingClientRect();
+      this.deps.onPatchConfig({ fabPosition: `${Math.round(r.left)},${Math.round(r.top)}` });
+    }
+    /**
+     * 把按钮放到配置记录的位置（空 = 左上角），并夹在视口内。
+     * 面板打开时按钮是 display:none，量不到尺寸，用 CSS 的 42 兜底。
+     */
+    applyFabPos() {
+      const fab = this.fabEl();
+      if (!fab || this.drag) return;
+      const w = fab.offsetWidth || 42;
+      const h = fab.offsetHeight || 42;
+      let left = 10;
+      let top = 12;
+      const raw = String(this.deps.getSnapshot().config.fabPosition || "").trim();
+      const m = /^(-?\d+)\s*,\s*(-?\d+)$/.exec(raw);
+      if (m) {
+        left = Number(m[1]);
+        top = Number(m[2]);
+      }
+      left = Math.min(Math.max(4, left), Math.max(4, window.innerWidth - w - 4));
+      top = Math.min(Math.max(4, top), Math.max(4, window.innerHeight - h - 4));
+      fab.style.left = left + "px";
+      fab.style.top = top + "px";
+      fab.style.right = "auto";
+    }
+    /** 复位到左上角。 */
+    resetFabPos() {
+      this.drag = null;
+      this.suppressClickAt = 0;
+      const fab = this.fabEl();
+      fab == null ? void 0 : fab.classList.remove("dragging");
+      if (fab) {
+        fab.style.left = "10px";
+        fab.style.top = "12px";
+        fab.style.right = "auto";
+      }
+      this.deps.onPatchConfig({ fabPosition: "" });
     }
     /**
      * missav 是 SPA，框架在路由切换时可能重建 body，把宿主元素一起清掉 ——
@@ -2637,15 +3078,28 @@ details[open] summary::before{content:"▾ "}
      */
     guardMount() {
       if (this.guard) return;
-      const mo = new MutationObserver(() => this.reattach());
-      mo.observe(document.documentElement, { childList: true });
-      if (document.body) mo.observe(document.body, { childList: true });
+      const mo = new MutationObserver(() => {
+        if (this.observedBody !== document.body) {
+          mo.disconnect();
+          this.observeTargets(mo);
+        }
+        this.reattach();
+      });
+      this.observeTargets(mo);
       this.guard = mo;
+    }
+    observeTargets(mo) {
+      mo.observe(document.documentElement, { childList: true });
+      this.observedBody = document.body;
+      if (this.observedBody) mo.observe(this.observedBody, { childList: true });
     }
     destroy() {
       var _a, _b;
       (_a = this.guard) == null ? void 0 : _a.disconnect();
       this.guard = null;
+      window.removeEventListener("resize", this.onViewportChange);
+      window.removeEventListener("orientationchange", this.onViewportChange);
+      this.drag = null;
       (_b = this.host) == null ? void 0 : _b.remove();
       this.host = null;
       this.root = null;
@@ -2653,6 +3107,40 @@ details[open] summary::before{content:"▾ "}
     /** 面板是否处于打开状态（用于决定要不要显示 toast）。 */
     isOpen() {
       return this.open;
+    }
+    /**
+     * 层级自检：真机上「齿轮点不动」时用它定位到底是被谁盖住了。
+     * elementFromPoint 返回的不是宿主，就说明有站点元素压在上面。
+     */
+    uiDiag() {
+      var _a;
+      const out = {
+        已进top_layer: this.onTopLayer,
+        宿主层级: this.host ? getComputedStyle(this.host).zIndex : null,
+        宿主仍在文档: !!this.host && this.host.isConnected
+      };
+      const fab = (_a = this.root) == null ? void 0 : _a.querySelector(".fab");
+      if (!fab) {
+        out.齿轮 = "未渲染";
+        return out;
+      }
+      const r = fab.getBoundingClientRect();
+      let cx;
+      let cy;
+      if (r.width && r.height) {
+        out.齿轮位置 = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
+        cx = r.x + r.width / 2;
+        cy = r.y + r.height / 2;
+      } else {
+        const left = parseFloat(fab.style.left) || 10;
+        const top = parseFloat(fab.style.top) || 12;
+        out.齿轮位置 = `隐藏（面板打开中，记录位置 ${Math.round(left)},${Math.round(top)} 42×42）`;
+        cx = left + 21;
+        cy = top + 21;
+      }
+      const el = document.elementFromPoint(cx, cy);
+      out["齿轮坐标最上层"] = el ? el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") : "null";
+      return out;
     }
     setOpen(open) {
       var _a;
@@ -2673,6 +3161,7 @@ details[open] summary::before{content:"▾ "}
       wrap.style.display = "";
       const fab = wrap.querySelector(".fab");
       fab.style.display = snapshot2.config.showFab ? "" : "none";
+      this.applyFabPos();
       const body = wrap.querySelector('[data-el="body"]');
       const active = (_b = this.root) == null ? void 0 : _b.activeElement;
       if (active && (active.tagName === "INPUT" || active.tagName === "SELECT")) return;
@@ -2750,6 +3239,42 @@ details[open] summary::before{content:"▾ "}
           </div>
           <div class="sw${c.showFab ? " on" : ""}" data-act="cfgBool" data-key="showFab" role="switch"></div>
         </div>
+        <div class="row">
+          <div style="flex:1">
+            <div class="name" style="font-size:12px">悬浮入口位置</div>
+            <div class="meta">按住齿轮拖到顺手的地方，位置会记住</div>
+          </div>
+          <button class="btn" data-act="resetFab">复位</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div style="flex:1">
+            <div class="name" style="font-size:12px">拦截跨站跳转</div>
+            <div class="meta">广告蒙层点了也不会把页面带走，已拦 ${s.adblock.count} 次</div>
+          </div>
+          <div class="sw${c.blockExternalNav ? " on" : ""}" data-act="cfgBool" data-key="blockExternalNav" role="switch"></div>
+        </div>
+        <div class="row">
+          <div style="flex:1">
+            <div class="name" style="font-size:12px">移除广告蒙层</div>
+            <div class="meta">拦截时把触发它的全屏浮层一起藏掉</div>
+          </div>
+          <div class="sw${c.removeAdOverlay ? " on" : ""}" data-act="cfgBool" data-key="removeAdOverlay" role="switch"></div>
+        </div>
+        <div class="row">
+          <div style="flex:1">
+            <div class="name" style="font-size:12px">拦截时提示</div>
+            <div class="meta">右下角弹一条「已阻止跳转」</div>
+          </div>
+          <div class="sw${c.notifyBlocked ? " on" : ""}" data-act="cfgBool" data-key="notifyBlocked" role="switch"></div>
+        </div>
+
+        <div class="field">额外放行域名</div>
+        <input class="inp" data-el="allowHosts" value="${esc(c.allowHosts)}" placeholder="missav.ws, example.com" spellcheck="false" />
+        <div class="hint">按后缀匹配，逗号分隔。当前站点及其子域、同主标签的镜像站已自动放行。</div>
+        ${s.adblock.last ? `<div class="hint">最近拦截：${esc(s.adblock.last)}</div>` : ""}
       </div>
 
       <div class="card">
@@ -2799,7 +3324,9 @@ details[open] summary::before{content:"▾ "}
       return parts.join("");
     }
     onClick(e) {
-      const target = e.target.closest("[data-act]");
+      const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+      const origin = path[0] || e.target;
+      const target = origin && origin.closest ? origin.closest("[data-act]") : null;
       if (!target) return;
       const act = target.dataset.act || "";
       const id = target.dataset.id || "";
@@ -2809,6 +3336,9 @@ details[open] summary::before{content:"▾ "}
           break;
         case "toggle":
           this.toggle();
+          break;
+        case "resetFab":
+          this.resetFabPos();
           break;
         case "toggleScript": {
           const snapshot2 = this.deps.getSnapshot();
@@ -2857,6 +3387,8 @@ details[open] summary::before{content:"▾ "}
         this.deps.onPatchConfig({ manifestUrl: el.value.trim() });
       } else if (key === "corsProxy") {
         this.deps.onPatchConfig({ corsProxy: el.value.trim() });
+      } else if (key === "allowHosts") {
+        this.deps.onPatchConfig({ allowHosts: el.value.trim() });
       } else if (key === "updateIntervalHours") {
         this.deps.onPatchConfig({ updateIntervalHours: Number(el.value) || 24 });
       }
@@ -2913,7 +3445,7 @@ details[open] summary::before{content:"▾ "}
     const digest = await crypto.subtle.digest("SHA-256", bytes);
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
-  function hostAllowed(target, manifestUrl) {
+  function hostAllowed2(target, manifestUrl) {
     let u;
     let base;
     try {
@@ -3043,7 +3575,7 @@ details[open] summary::before{content:"▾ "}
         result.upToDate.push(entry.id);
         continue;
       }
-      if (!hostAllowed(entry.url, config.manifestUrl)) {
+      if (!hostAllowed2(entry.url, config.manifestUrl)) {
         result.errors.push(`${entry.id}：下载地址不在允许的域名内（${entry.url}）`);
         continue;
       }
@@ -3134,7 +3666,7 @@ details[open] summary::before{content:"▾ "}
   }
 
   // src/index.ts
-  var LOADER_VERSION = "1.0.1";
+  var LOADER_VERSION = "1.0.4";
   var SCRIPTS_KEY = "scripts";
   var BOOT_FLAG = "__PAKE_USERSCRIPT_LOADER__";
   var state = {
@@ -3150,6 +3682,20 @@ details[open] summary::before{content:"▾ "}
   };
   var ui = null;
   var currentUrl = "";
+  var lastAdToastAt = 0;
+  function onAdBlocked(kind, url) {
+    log("warn", "adblock", `已拦截${kind}：${url}`);
+    if (!state.config.notifyBlocked) return;
+    const now = Date.now();
+    if (now - lastAdToastAt < 1500) return;
+    lastAdToastAt = now;
+    let host = url;
+    try {
+      host = new URL(url).hostname;
+    } catch {
+    }
+    ui == null ? void 0 : ui.toast("已阻止跳转：" + host, true);
+  }
   function setMessage(text, isError = false) {
     state.message = text;
     state.messageError = isError;
@@ -3165,7 +3711,8 @@ details[open] summary::before{content:"▾ "}
       lastCheck: state.lastCheck,
       busy: state.busy,
       message: state.message,
-      messageError: state.messageError
+      messageError: state.messageError,
+      adblock: adBlockStats()
     };
   }
   function mergeBuiltins(scripts) {
@@ -3384,6 +3931,28 @@ details[open] summary::before{content:"▾ "}
       setMessage("菜单命令执行失败：" + describeError(err), true);
     }
   }
+  function installEarlyCapture() {
+    const onCapture = (e) => {
+      if (!ui) return;
+      if (e.type === "pointermove") {
+        if (!ui.isDragging()) return;
+        ui.handleDragMove(e);
+        e.stopImmediatePropagation();
+        return;
+      }
+      if (e.type === "pointerup" || e.type === "pointercancel") {
+        if (!ui.isDragging()) return;
+        ui.handleDragEnd();
+        e.stopImmediatePropagation();
+        return;
+      }
+      if (!ui.handleEvent(e)) return;
+      e.stopImmediatePropagation();
+    };
+    for (const type of ["pointerdown", "touchstart", "click", "pointermove", "pointerup", "pointercancel"]) {
+      window.addEventListener(type, onCapture, true);
+    }
+  }
   function whenDomReady(fn) {
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", fn, { once: true });
@@ -3398,6 +3967,8 @@ details[open] summary::before{content:"▾ "}
       return;
     }
     w[BOOT_FLAG] = { version: LOADER_VERSION };
+    installEarlyCapture();
+    installAdBlock({ getConfig: () => state.config, onBlock: onAdBlocked });
     log("info", "loader", `Loader v${LOADER_VERSION} 启动 @ ${location.host}`);
     state.config = await loadConfig();
     state.lastCheck = await readLastCheck();
@@ -3444,6 +4015,36 @@ details[open] summary::before{content:"▾ "}
     api.clearLogs = () => clearLogs();
     api.check = () => runUpdateCheck(true);
     api.version = LOADER_VERSION;
+    api.adblock = () => adBlockStats();
+    api.diag = async () => {
+      const info = nativeChannelInfo();
+      const target = "https://api-shoulei-ssl.xunlei.com/oracle/subtitle?name=ABC-123";
+      const out = {
+        版本: LOADER_VERSION,
+        "通道1_原生JS_API(__TAURI__.http.fetch)": info.globalTauri,
+        "通道2_IPC(__TAURI_INTERNALS__.invoke)": info.ipc,
+        "通道4_中继配置": state.config.corsProxy || "未配置",
+        UI层级: ui ? ui.uiDiag() : "未挂载",
+        广告拦截: adBlockStats()
+      };
+      if (info.ipc) {
+        try {
+          const res = await w.__TAURI_INTERNALS__.invoke("plugin:http|fetch", {
+            clientConfig: { url: target, method: "GET", headers: {} }
+          });
+          out["通道2_实际请求"] = "HTTP " + (res && res.status);
+        } catch (err) {
+          out["通道2_实际请求"] = "失败：" + describeError(err);
+        }
+      }
+      try {
+        const r = await fetch(target, { mode: "cors" });
+        out["通道3_直连fetch"] = "HTTP " + r.status;
+      } catch (err) {
+        out["通道3_直连fetch"] = "失败（预期，CORS）：" + describeError(err);
+      }
+      return out;
+    };
   }
   boot().catch((err) => {
     console.error("[PakeLoader] 启动失败：", err);
